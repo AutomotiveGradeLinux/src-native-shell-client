@@ -2,4 +2,4 @@
 host=gerrit.automotivelinux.org
 port=29418
 project=src/native-shell-client
-defaultbranch=master
+defaultbranch=pike
