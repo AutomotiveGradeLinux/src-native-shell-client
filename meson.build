@@ -37,7 +37,7 @@ dep_scanner = dependency('wayland-scanner', native: true)
 prog_scanner = find_program(dep_scanner.get_variable('wayland_scanner'))
 dep_wp = dependency('wayland-protocols', version: '>= 1.12')
 dir_wp_base = dep_wp.get_variable('pkgdatadir')
-agl_compositor_dep = dependency('agl-compositor-0.0.22-protocols')
+agl_compositor_dep = dependency('agl-compositor-0.0.24-protocols')
 dir_agl_compositor_base = agl_compositor_dep.get_variable('pkgdatadir')
 
 xdg_shell_xml = join_paths(dir_wp_base, 'stable', 'xdg-shell', 'xdg-shell.xml')
