@@ -37,6 +37,7 @@
 #include <wayland-client.h>
 #include "shared/os-compatibility.h"
 
+
 #include "agl-shell-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
@@ -47,9 +48,22 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #endif
 
+#ifndef container_of
+#define container_of(ptr, type, member) ({				\
+	const __typeof__( ((type *)0)->member ) *__mptr = (ptr);	\
+	(type *)( (char *)__mptr - offsetof(type,member) );})
+#endif
+
 struct data_output {
 	int width, height;
 	int offset_x, offset_y;
+
+	struct display *display;
+	struct wl_output *wl_output;
+	struct wl_list link; /* struct display::output_list */
+	uint32_t name;
+	enum wl_output_transform transform;
+	int32_t scale;
 };
 
 enum window_type {
@@ -69,9 +83,7 @@ struct display {
 	struct xdg_wm_base *wm_base;
 
 	struct agl_shell *agl_shell;
-	struct wl_output *output;
-
-	struct data_output doutput;
+	struct wl_list output_list;
 
 	struct wl_shm *shm;
 	bool has_xrgb;
@@ -361,7 +373,7 @@ paint_pixels_bottom(void *image, int padding, int width, int height)
 static void
 paint_pixels_bg(void *image, int padding, int width, int height)
 {
-	memset(image, 0x00, width * height * 4);
+	memset(image, 0xf0, width * height * 4);
 }
 
 static const struct wl_callback_listener frame_listener;
@@ -454,13 +466,14 @@ static void
 display_handle_mode(void *data, struct wl_output *wl_output, uint32_t flags,
 		    int width, int height, int refresh)
 {
+#if 0
 	struct display *d = data;
 
 	if (wl_output == d->output && (flags & WL_OUTPUT_MODE_CURRENT)) {
 		d->doutput.width = width;
 		d->doutput.height = height;
 	}
-
+#endif
 }
 
 static void
@@ -718,6 +731,42 @@ static const struct wl_seat_listener seat_listener = {
 	seat_handle_name,
 };
 
+static void
+display_add_output(struct display *d, uint32_t id, uint32_t version)
+{
+
+	struct data_output *output;
+
+	output = calloc(1, sizeof *output);
+	output->display = d;
+	output->scale = 1;
+	fprintf(stderr, "%s()\n", __func__);
+
+	output->wl_output = 
+		wl_registry_bind(d->registry, id, &wl_output_interface, MAX(version, 3));
+	output->name = id;
+	wl_list_insert(d->output_list.prev, &output->link);
+
+	wl_output_add_listener(output->wl_output, &output_listener, output);
+}
+
+static void
+display_destroy_output(struct display *d, struct data_output *output)
+{
+	wl_output_destroy(output->wl_output);
+	wl_list_remove(&output->link);
+	free(output);
+}
+
+static void
+display_destroy_outputs(struct display *d)
+{
+	struct data_output *tmp;
+	struct data_output *output;
+
+	wl_list_for_each_safe(output, tmp, &d->output_list, link)
+		display_destroy_output(d, output);
+}
 
 static void
 registry_handle_global(void *data, struct wl_registry *registry,
@@ -744,10 +793,7 @@ registry_handle_global(void *data, struct wl_registry *registry,
 		d->agl_shell = wl_registry_bind(registry, id,
 				&agl_shell_interface, MAX(version, 1));
 	} else if (strcmp(interface, "wl_output") == 0) {
-		d->output = wl_registry_bind(registry, id,
-					     &wl_output_interface,
-					     MAX(version, 3));
-		wl_output_add_listener(d->output, &output_listener, d);
+		display_add_output(d, id, version);
 	}
 }
 
@@ -775,6 +821,7 @@ create_display(void)
 	}
 	display->display = wl_display_connect(NULL);
 	assert(display->display);
+	wl_list_init(&display->output_list);
 
 	display->has_xrgb = false;
 	display->registry = wl_display_get_registry(display->display);
@@ -826,19 +873,37 @@ signal_int(int signum)
 }
 
 static void
-agl_shell_do_background(struct display *d, struct wl_surface *sufrace)
+agl_shell_do_background(struct display *d, const char *output_name, struct wl_surface *sufrace)
 {
 	if (d->agl_shell) {
-		agl_shell_set_background(d->agl_shell, sufrace, d->output);
+		struct wl_output *picked_output = NULL;
+
+		if (!output_name) {
+			struct data_output *first_data = 
+				container_of(d->output_list.next, struct data_output, link);
+			picked_output = first_data->wl_output;
+		}
+
+		assert(picked_output);
+		agl_shell_set_background(d->agl_shell, sufrace, picked_output);
 	}
 }
 
 void
-agl_shell_do_panel(struct display *d, struct wl_surface *sufrace,
+agl_shell_do_panel(struct display *d, struct wl_surface *sufrace, const char *output_name,
 		  enum agl_shell_edge mode)
 {
 	if (d->agl_shell) {
-		agl_shell_set_panel(d->agl_shell, sufrace, d->output, mode);
+		struct wl_output *picked_output = NULL;
+
+		if (!output_name) {
+			struct data_output *first_data = 
+				container_of(d->output_list.next, struct data_output, link);
+			picked_output = first_data->wl_output;
+		}
+
+		assert(picked_output);
+		agl_shell_set_panel(d->agl_shell, sufrace, picked_output, mode);
 	}
 }
 
@@ -887,7 +952,7 @@ main(int argc, char *argv[])
 		redraw(window, NULL, 0);
 	}
 
-	agl_shell_do_background(display, window->surface);
+	agl_shell_do_background(display, NULL, window->surface);
 
 	while (running && ret != -1) {
 		ret = wl_display_dispatch(display->display);
@@ -898,6 +963,7 @@ main(int argc, char *argv[])
 		}
 	}
 
+	display_destroy_outputs(display);
 	destroy_window(window);
 	destroy_display(display);
 
