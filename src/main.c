@@ -47,9 +47,15 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #endif
 
+struct display;
+
 struct data_output {
+	struct display *display;
+	struct wl_output *output;
+	uint32_t output_id;
 	int width, height;
 	int offset_x, offset_y;
+	struct wl_list link; /** display::outputs */
 };
 
 enum window_type {
@@ -69,9 +75,8 @@ struct display {
 	struct xdg_wm_base *wm_base;
 
 	struct agl_shell *agl_shell;
-	struct wl_output *output;
-
-	struct data_output doutput;
+	struct wl_list outputs;
+	struct wl_list windows;
 
 	struct wl_shm *shm;
 	bool has_xrgb;
@@ -103,6 +108,7 @@ struct window {
 
 	int fullscreen, maximized;
 	enum window_type type;
+	struct wl_list link; /* display::windows */
 };
 
 static int running = 1;
@@ -315,6 +321,7 @@ destroy_window(struct window *window)
 		xdg_surface_destroy(window->xdg_surface);
 
 	wl_surface_destroy(window->surface);
+	wl_list_remove(&window->link);
 	free(window);
 }
 
@@ -454,13 +461,10 @@ static void
 display_handle_mode(void *data, struct wl_output *wl_output, uint32_t flags,
 		    int width, int height, int refresh)
 {
-	struct display *d = data;
+	struct data_output *d = data;
 
-	if (wl_output == d->output && (flags & WL_OUTPUT_MODE_CURRENT)) {
-		d->doutput.width = width;
-		d->doutput.height = height;
-	}
-
+	d->width = width;
+	d->height = height;
 }
 
 static void
@@ -493,6 +497,28 @@ static const struct wl_output_listener output_listener = {
 	display_handle_desc,
 };
 
+static void
+display_add_output(struct display *d, uint32_t id)
+{
+	struct data_output *output;
+
+	output = calloc(1, sizeof *output);
+	output->display = d;
+	output->output =
+		wl_registry_bind(d->registry, id, &wl_output_interface, 4);
+
+	output->output_id = id;
+	wl_list_insert(d->outputs.prev, &output->link);
+
+	wl_output_add_listener(output->output, &output_listener, output);
+}
+
+static void
+display_remove_output(struct data_output *output)
+{
+	wl_list_remove(&output->link);
+	free(output);
+}
 
 static void
 pointer_handle_enter(void *data, struct wl_pointer *pointer,
@@ -744,10 +770,7 @@ registry_handle_global(void *data, struct wl_registry *registry,
 		d->agl_shell = wl_registry_bind(registry, id,
 				&agl_shell_interface, MAX(version, 1));
 	} else if (strcmp(interface, "wl_output") == 0) {
-		d->output = wl_registry_bind(registry, id,
-					     &wl_output_interface,
-					     MAX(version, 3));
-		wl_output_add_listener(d->output, &output_listener, d);
+		display_add_output(d, id);
 	}
 }
 
@@ -775,6 +798,9 @@ create_display(void)
 	}
 	display->display = wl_display_connect(NULL);
 	assert(display->display);
+
+	wl_list_init(&display->outputs);
+	wl_list_init(&display->windows);
 
 	display->has_xrgb = false;
 	display->registry = wl_display_get_registry(display->display);
@@ -804,6 +830,9 @@ create_display(void)
 static void
 destroy_display(struct display *display)
 {
+	struct data_output *output;
+	struct window *window;
+
 	if (display->shm)
 		wl_shm_destroy(display->shm);
 
@@ -812,6 +841,14 @@ destroy_display(struct display *display)
 
 	if (display->compositor)
 		wl_compositor_destroy(display->compositor);
+
+	wl_list_for_each(output, &display->outputs, link) {
+		display_remove_output(output);
+	}
+
+	wl_list_for_each(window, &display->windows, link) {
+		destroy_window(window);
+	}
 
 	wl_registry_destroy(display->registry);
 	wl_display_flush(display->display);
@@ -826,10 +863,31 @@ signal_int(int signum)
 }
 
 static void
-agl_shell_do_background(struct display *d, struct wl_surface *sufrace)
+agl_shell_do_background(struct display *d)
 {
-	if (d->agl_shell) {
-		agl_shell_set_background(d->agl_shell, sufrace, d->output);
+	struct data_output *output;
+
+	if (!d->agl_shell)
+		return;
+
+	wl_list_for_each(output, &d->outputs, link) {
+		struct window *window;
+
+		window = create_window(d, 250, 250, WINDOW_BG);
+
+		if (!window)
+			return;
+
+		/* Initialise damage to full surface, so the padding gets painted */
+		wl_surface_damage(window->surface, 0, 0,
+				window->width, window->height);
+
+		if (!window->wait_for_configure)
+			redraw(window, NULL, 0);
+
+		agl_shell_set_background(d->agl_shell, window->surface, output->output);
+
+		wl_list_insert(&d->windows, &window->link);
 	}
 }
 
@@ -837,9 +895,12 @@ void
 agl_shell_do_panel(struct display *d, struct wl_surface *sufrace,
 		  enum agl_shell_edge mode)
 {
-	if (d->agl_shell) {
-		agl_shell_set_panel(d->agl_shell, sufrace, d->output, mode);
-	}
+	struct data_output *output;
+
+	if (!d->agl_shell)
+		return;
+
+	/* handle panel set-up here */
 }
 
 static void
@@ -856,9 +917,7 @@ main(int argc, char *argv[])
 	struct sigaction sigint;
         struct display *display;
 
-        struct window *window;
-
-        int ret = 0;
+	int ret = 0;
 	int set_ready = 0;
 
 	sigint.sa_handler = signal_int;
@@ -872,22 +931,8 @@ main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	window = create_window(display, 250, 250, WINDOW_BG);
-	if (!window) {
-		fprintf(stderr, "failed to create window!\n");
-		exit(EXIT_FAILURE);
-	}
 
-	/* Initialise damage to full surface, so the padding gets painted */
-	wl_surface_damage(window->surface, 0, 0,
-			window->width, window->height);
-
-	if (!window->wait_for_configure) {
-		fprintf(stderr, "wait_for_configure not set, doing a redraw\n");
-		redraw(window, NULL, 0);
-	}
-
-	agl_shell_do_background(display, window->surface);
+	agl_shell_do_background(display);
 
 	while (running && ret != -1) {
 		ret = wl_display_dispatch(display->display);
@@ -898,7 +943,6 @@ main(int argc, char *argv[])
 		}
 	}
 
-	destroy_window(window);
 	destroy_display(display);
 
 	return 0;
